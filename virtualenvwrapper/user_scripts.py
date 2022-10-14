@@ -18,12 +18,22 @@ log = logging.getLogger(__name__)
 # Are we running under msys
 if sys.platform == 'win32' and \
    os.environ.get('OS') == 'Windows_NT' and \
-   os.environ.get('MSYSTEM') == 'MINGW32':
+   os.environ.get('MSYSTEM') in ('MINGW32', 'MINGW64'):
     is_msys = True
     script_folder = 'Scripts'
 else:
     is_msys = False
     script_folder = 'bin'
+
+
+def _get_msys_shell():
+    if 'MSYS_HOME' in os.environ:
+        return [get_path(os.environ['MSYS_HOME'], 'bin', 'sh.exe')]
+    else:
+        for path in os.environ['PATH'].split(';'):
+            if os.path.exists(os.path.join(path, 'sh.exe')):
+                return [get_path(path, 'sh.exe')]
+    raise Exception('Could not find sh.exe')
 
 
 def run_script(script_path, *args):
@@ -32,14 +42,14 @@ def run_script(script_path, *args):
     if os.path.exists(script_path):
         cmd = [script_path] + list(args)
         if is_msys:
-            cmd = [get_path(os.environ['MSYS_HOME'], 'bin', 'sh.exe')] + cmd
+            cmd = _get_msys_shell() + cmd
         log.debug('running %s', str(cmd))
         try:
             subprocess.call(cmd)
         except OSError:
             _, msg, _ = sys.exc_info()
             log.error('could not run "%s": %s', script_path, str(msg))
-        #log.debug('Returned %s', return_code)
+        # log.debug('Returned %s', return_code)
     return
 
 
@@ -51,68 +61,109 @@ def run_global(script_name, *args):
     return
 
 
-PERMISSIONS = stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH
+PERMISSIONS = (
+    stat.S_IRWXU    # read/write/execute, user
+    | stat.S_IRGRP  # read, group
+    | stat.S_IXGRP  # execute, group
+    | stat.S_IROTH  # read, others
+    | stat.S_IXOTH  # execute, others
+)
+PERMISSIONS_SOURCED = PERMISSIONS & ~(
+    # remove executable bits for
+    stat.S_IXUSR     # ... user
+    | stat.S_IXGRP   # ... group
+    | stat.S_IXOTH   # ... others
+)
 
 
 GLOBAL_HOOKS = [
     # initialize
     ("initialize",
-     "This hook is run during the startup phase "
-     "when loading virtualenvwrapper.sh."),
+     "This hook is sourced during the startup phase "
+     "when loading virtualenvwrapper.sh.",
+     PERMISSIONS_SOURCED),
 
     # mkvirtualenv
     ("premkvirtualenv",
      "This hook is run after a new virtualenv is created "
-     "and before it is activated."),
+     "and before it is activated.\n"
+     "# argument: name of new environment",
+     PERMISSIONS),
     ("postmkvirtualenv",
-     "This hook is run after a new virtualenv is activated."),
+     "This hook is sourced after a new virtualenv is activated.",
+     PERMISSIONS_SOURCED),
+
+    # cpvirtualenv:
+    # precpvirtualenv <old> <new> (run),
+    # postcpvirtualenv (sourced)
 
     # rmvirtualenv
     ("prermvirtualenv",
-     "This hook is run before a virtualenv is deleted."),
+     "This hook is run before a virtualenv is deleted.\n"
+     "# argument: full path to environment directory",
+     PERMISSIONS),
     ("postrmvirtualenv",
-     "This hook is run after a virtualenv is deleted."),
+     "This hook is run after a virtualenv is deleted.\n"
+     "# argument: full path to environment directory",
+     PERMISSIONS),
 
     # deactivate
     ("predeactivate",
-     "This hook is run before every virtualenv is deactivated."),
+     "This hook is sourced before every virtualenv is deactivated.",
+     PERMISSIONS_SOURCED),
     ("postdeactivate",
-     "This hook is run after every virtualenv is deactivated."),
+     "This hook is sourced after every virtualenv is deactivated.",
+     PERMISSIONS_SOURCED),
 
     # activate
     ("preactivate",
-     "This hook is run before every virtualenv is activated."),
+     "This hook is run before every virtualenv is activated.\n"
+     "# argument: environment name",
+     PERMISSIONS),
     ("postactivate",
-     "This hook is run after every virtualenv is activated."),
+     "This hook is sourced after every virtualenv is activated.",
+     PERMISSIONS_SOURCED),
+
+    # mkproject:
+    # premkproject <new project name> (run),
+    # postmkproject (sourced)
 
     # get_env_details
     ("get_env_details",
      "This hook is run when the list of virtualenvs is printed "
-     "so each name can include details."),
+     "so each name can include details.\n"
+     "# argument: environment name",
+     PERMISSIONS),
 ]
 
 
 LOCAL_HOOKS = [
     # deactivate
     ("predeactivate",
-     "This hook is run before this virtualenv is deactivated."),
+     "This hook is sourced before this virtualenv is deactivated.",
+     PERMISSIONS_SOURCED),
     ("postdeactivate",
-     "This hook is run after this virtualenv is deactivated."),
+     "This hook is sourced after this virtualenv is deactivated.",
+     PERMISSIONS_SOURCED),
 
     # activate
     ("preactivate",
-     "This hook is run before this virtualenv is activated."),
+     "This hook is run before this virtualenv is activated.",
+     PERMISSIONS),
     ("postactivate",
-     "This hook is run after this virtualenv is activated."),
+     "This hook is sourced after this virtualenv is activated.",
+     PERMISSIONS_SOURCED),
 
     # get_env_details
     ("get_env_details",
      "This hook is run when the list of virtualenvs is printed "
-     "in 'long' mode so each name can include details."),
+     "in 'long' mode so each name can include details.\n"
+     "# argument: environment name",
+     PERMISSIONS),
 ]
 
 
-def make_hook(filename, comment):
+def make_hook(filename, comment, permissions):
     """Create a hook script.
 
     :param filename: The name of the file to write.
@@ -123,15 +174,15 @@ def make_hook(filename, comment):
         log.info('creating %s', filename)
         f = open(filename, 'w')
         try:
-            f.write("""#!%(shell)s
-# %(comment)s
-
-""" % {'comment': comment,
-       'shell': os.environ.get('SHELL', '/bin/sh'),
-       })
+            # for sourced scripts, the shebang line won't be used;
+            # it is useful for editors to recognize the file type, though
+            f.write("#!%(shell)s\n# %(comment)s\n\n" % {
+                'comment': comment,
+                'shell': os.environ.get('SHELL', '/bin/sh'),
+            })
         finally:
             f.close()
-        os.chmod(filename, PERMISSIONS)
+        os.chmod(filename, permissions)
     return
 
 
@@ -139,8 +190,9 @@ def make_hook(filename, comment):
 
 
 def initialize(args):
-    for filename, comment in GLOBAL_HOOKS:
-        make_hook(get_path('$VIRTUALENVWRAPPER_HOOK_DIR', filename), comment)
+    for filename, comment, permissions in GLOBAL_HOOKS:
+        make_hook(get_path('$VIRTUALENVWRAPPER_HOOK_DIR', filename),
+                  comment, permissions)
     return
 
 
@@ -157,14 +209,15 @@ def initialize_source(args):
 def pre_mkvirtualenv(args):
     log.debug('pre_mkvirtualenv %s', str(args))
     envname = args[0]
-    for filename, comment in LOCAL_HOOKS:
+    for filename, comment, permissions in LOCAL_HOOKS:
         make_hook(get_path('$WORKON_HOME', envname, script_folder, filename),
-                  comment)
+                  comment, permissions)
     run_global('premkvirtualenv', *args)
     return
 
 
 def post_mkvirtualenv_source(args):
+    log.debug('post_mkvirtualenv_source %s', str(args))
     return """
 #
 # Run user-provided scripts
@@ -177,14 +230,15 @@ def post_mkvirtualenv_source(args):
 def pre_cpvirtualenv(args):
     log.debug('pre_cpvirtualenv %s', str(args))
     envname = args[0]
-    for filename, comment in LOCAL_HOOKS:
+    for filename, comment, permissions in LOCAL_HOOKS:
         make_hook(get_path('$WORKON_HOME', envname, script_folder, filename),
-                  comment)
+                  comment, permissions)
     run_global('precpvirtualenv', *args)
     return
 
 
 def post_cpvirtualenv_source(args):
+    log.debug('post_cpvirtualenv_source %s', str(args))
     return """
 #
 # Run user-provided scripts
@@ -216,7 +270,7 @@ def pre_activate(args):
 
 
 def post_activate_source(args):
-    log.debug('post_activate')
+    log.debug('post_activate_source')
     return """
 #
 # Run user-provided scripts
@@ -229,7 +283,7 @@ def post_activate_source(args):
 
 
 def pre_deactivate_source(args):
-    log.debug('pre_deactivate')
+    log.debug('pre_deactivate_source')
     return """
 #
 # Run user-provided scripts
@@ -242,7 +296,7 @@ def pre_deactivate_source(args):
 
 
 def post_deactivate_source(args):
-    log.debug('post_deactivate')
+    log.debug('post_deactivate_source')
     return """
 #
 # Run user-provided scripts
